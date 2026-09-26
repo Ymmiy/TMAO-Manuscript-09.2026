@@ -1,0 +1,631 @@
+---
+title: "Updated analyses"
+author: "P. Lee"
+date: "27.10.2025"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: 4
+    number_sections: no
+  word_document:
+    toc: yes
+    toc_depth: 4
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  error = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  cache = FALSE
+)
+
+library(tidyverse)
+library(nlme)
+library(survival)
+library(knitr)
+
+options(scipen = 999)
+
+# Fixed-effect table for nlme::lme models.
+# Uses nlme directly to avoid version-sensitive extraction of random-effect
+# variances by parameters/datawizard. Sample size is deliberately not printed.
+print_lme_fixed <- function(model, digits = 3) {
+  tt <- as.data.frame(summary(model)$tTable)
+  tt$Parameter <- rownames(tt)
+  rownames(tt) <- NULL
+
+  crit <- qt(0.975, df = tt$DF)
+  tt$CI_low <- tt$Value - crit * tt$Std.Error
+  tt$CI_high <- tt$Value + crit * tt$Std.Error
+
+  p_fmt <- ifelse(
+    is.na(tt$`p-value`),
+    NA_character_,
+    ifelse(
+      tt$`p-value` < 0.001,
+      "<0.001",
+      formatC(tt$`p-value`, format = "f", digits = digits)
+    )
+  )
+
+  out <- data.frame(
+    Parameter = tt$Parameter,
+    Estimate = round(tt$Value, digits),
+    SE = round(tt$Std.Error, digits),
+    `95% CI` = sprintf(
+      paste0("%.", digits, "f to %.", digits, "f"),
+      tt$CI_low, tt$CI_high
+    ),
+    DF = tt$DF,
+    `t value` = round(tt$`t-value`, digits),
+    `p value` = p_fmt,
+    check.names = FALSE
+  )
+
+  print(
+    knitr::kable(
+      out,
+      align = c("l", "r", "r", "c", "r", "r", "r")
+    )
+  )
+}
+
+# Numeric fixed-effect table for survival::coxph models.
+# Avoids forestmodel/ggplot compatibility issues and deliberately does not
+# print sample size or event counts.
+print_cox_table <- function(model, digits = 3) {
+  beta <- stats::coef(model)
+  vc <- stats::vcov(model)
+
+  common <- intersect(names(beta), rownames(vc))
+  beta <- beta[common]
+  se <- sqrt(diag(vc[common, common, drop = FALSE]))
+
+  z <- beta / se
+  p <- 2 * stats::pnorm(abs(z), lower.tail = FALSE)
+  lower <- exp(beta - stats::qnorm(0.975) * se)
+  upper <- exp(beta + stats::qnorm(0.975) * se)
+
+  fmt_num <- function(x) {
+    ifelse(
+      is.na(x),
+      NA_character_,
+      formatC(x, format = "f", digits = digits)
+    )
+  }
+
+  fmt_p <- function(x) {
+    ifelse(
+      is.na(x),
+      NA_character_,
+      ifelse(
+        x < 0.001,
+        "<0.001",
+        formatC(x, format = "f", digits = digits)
+      )
+    )
+  }
+
+  out <- data.frame(
+    Parameter = names(beta),
+    HR = fmt_num(exp(beta)),
+    `95% CI` = paste0(fmt_num(lower), " to ", fmt_num(upper)),
+    `p value` = fmt_p(p),
+    check.names = FALSE,
+    row.names = NULL
+  )
+
+  print(
+    knitr::kable(
+      out,
+      align = c("l", "r", "c", "r")
+    )
+  )
+}
+```
+
+```{r data-wrangling}
+dd <- read_csv("Baseline.csv")
+dd <- dd %>%
+  mutate(tmao_q = as.factor(ntile(tmao,5)))
+dd$tmao_log <- log1p(dd$tmao )
+dd$tmao_q <- as.factor(dd$tmao_q)
+
+ddns <- dd %>%
+  filter(type_of_lesion == 'No Stroke')
+ddos <- dd %>%
+  filter(type_of_lesion == 'Overt Stroke')
+ddss <- dd %>%
+  filter(type_of_lesion == 'Silent Stroke')
+
+FUP3 <- read_csv("FUP3.csv")
+FUP3 <- FUP3 %>%
+  mutate(tmao_q = as.factor(ntile(tmao,5)))
+FUP3$tmao_log <- log1p(FUP3$tmao )
+FUP3$tmao_q <- as.factor(FUP3$tmao_q)
+
+FUP3 <- FUP3 %>%
+  group_by(pat.id) %>%
+  # Extract the baseline creatinine.gfr value for each patient
+  mutate(baseline_creatinine = creatinine.gfr[visit.name == "Baseline"][1]) %>%
+  # Replace missing creatinine.gfr with the baseline value
+  mutate(creatinine.gfr = ifelse(is.na(creatinine.gfr), baseline_creatinine, creatinine.gfr)) %>%
+  ungroup() %>%
+  # Optionally, remove the temporary column
+  select(-baseline_creatinine)
+
+WGS <- read_csv("WGS.csv")
+WGS <- WGS %>%
+  mutate(tmao_q = as.factor(ntile(tmao,5)))
+WGS$tmao_log <- log1p(WGS$tmao )
+WGS$tmao_q <- as.factor(WGS$tmao_q)
+
+WGS <- WGS %>%
+  group_by(pat.id) %>%
+  # Extract the baseline creatinine.gfr value for each patient
+  mutate(baseline_creatinine = creatinine.gfr[visit.name == "Baseline"][1]) %>%
+  # Replace missing creatinine.gfr with the baseline value
+  mutate(creatinine.gfr = ifelse(is.na(creatinine.gfr), baseline_creatinine, creatinine.gfr)) %>%
+  ungroup() %>%
+  # Optionally, remove the temporary column
+  select(-baseline_creatinine)
+```
+
+# Sensitivity analyses for TMAO with HV for LTG and STG  
+
+Model 1: age, sex, total intracranial volume, education level  
+Model 2: model 1 + smoking, bmi, HT, physical activity + alcohol  
+Model 3: model 2 + History of CAD + History of stroke/TIA  
+Model 4: model 3 + DM + eGFR  
+
+## Long-term group  
+### TMAO Quintiles  
+
+* Model 1
+```{r m21, results='asis'}
+fup3 <- FUP3 %>%
+  filter(visit.name == 'Baseline')
+
+m21 <- lme(HVraw ~ tmao_q +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups,
+          random = ~1|center, data=fup3,
+          na.action=na.exclude)
+
+print_lme_fixed(m21)
+```
+
+* Model 2
+```{r m22, results='asis'}
+m22 <- lme(HVraw ~ tmao_q  +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption,
+          random = ~1 | center, data=fup3,
+          na.action=na.exclude)
+
+print_lme_fixed(m22)
+```
+
+* Model 3
+```{r m23, results='asis'}
+m23 <- lme(HVraw ~ tmao_q +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption + prev.coronary.heart.disease + prev.stroke.tia,
+          random = ~1 | center, data=fup3,
+          na.action=na.exclude)
+
+print_lme_fixed(m23)
+```
+
+* Model 4
+```{r m24, results='asis'}
+m24 <- lme(HVraw ~ tmao_q +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption + prev.coronary.heart.disease + prev.stroke.tia
+          +prev.diabetes + creatinine.gfr,
+          random = ~1 | center, data=fup3,
+          na.action=na.exclude)
+
+print_lme_fixed(m24)
+```
+\newpage
+
+### TMAO Continuous  
+
+* Model 1
+```{r m210, results='asis'}
+m210 <- lme(HVraw ~ tmao_log +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups,
+          random = ~1|center, data=fup3,
+          na.action=na.exclude)
+
+print_lme_fixed(m210)
+```
+
+* Model 2
+```{r m220, results='asis'}
+m220 <- lme(HVraw ~ tmao_log  +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption,
+          random = ~1 | center, data=fup3,
+          na.action=na.exclude)
+
+print_lme_fixed(m220)
+```
+
+* Model 3
+```{r m230, results='asis'}
+m230 <- lme(HVraw ~ tmao_log +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption + prev.coronary.heart.disease + prev.stroke.tia,
+          random = ~1 | center, data=fup3,
+          na.action=na.exclude)
+
+print_lme_fixed(m230)
+```
+
+* Model 4
+```{r m240, results='asis'}
+m240 <- lme(HVraw ~ tmao_log +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption + prev.coronary.heart.disease + prev.stroke.tia
+          +prev.diabetes + creatinine.gfr,
+          random = ~1 | center, data=fup3,
+          na.action=na.exclude)
+
+print_lme_fixed(m240)
+```
+
+\newpage
+
+## Short term group  
+
+### TMAO Quintiles
+
+* Model 1
+```{r m25, results='asis'}
+wgs <- WGS %>%
+  filter(visit.name == 'Baseline')
+
+m25 <- lme(HVraw ~ tmao_q +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups,
+          random = ~1|center, data=wgs,
+          na.action=na.exclude)
+
+print_lme_fixed(m25)
+```
+
+* Model 2
+```{r m26, results='asis'}
+m26 <- lme(HVraw ~ tmao_q  +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption,
+          random = ~1 | center, data=wgs,
+          na.action=na.exclude)
+
+print_lme_fixed(m26)
+```
+
+* Model 3
+```{r m27, results='asis'}
+m27 <- lme(HVraw ~ tmao_q +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption + prev.coronary.heart.disease + prev.stroke.tia,
+          random = ~1 | center, data=wgs,
+          na.action=na.exclude)
+
+print_lme_fixed(m27)
+```
+
+* Model 4
+```{r m28, results='asis'}
+m28 <- lme(HVraw ~ tmao_q +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption + prev.coronary.heart.disease + prev.stroke.tia
+          +prev.diabetes + creatinine.gfr,
+          random = ~1 | center, data=wgs,
+          na.action=na.exclude)
+
+print_lme_fixed(m28)
+```
+\newpage
+
+### TMAO Continuous
+
+* Model 1
+```{r m250, results='asis'}
+m250 <- lme(HVraw ~ tmao_log +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups,
+          random = ~1|center, data=wgs,
+          na.action=na.exclude)
+
+print_lme_fixed(m250)
+```
+
+* Model 2
+```{r m260, results='asis'}
+m260 <- lme(HVraw ~ tmao_log  +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption,
+          random = ~1 | center, data=wgs,
+          na.action=na.exclude)
+
+print_lme_fixed(m260)
+```
+
+* Model 3
+```{r m270, results='asis'}
+m270 <- lme(HVraw ~ tmao_log +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption + prev.coronary.heart.disease + prev.stroke.tia,
+          random = ~1 | center, data=wgs,
+          na.action=na.exclude)
+
+print_lme_fixed(m270)
+```
+
+* Model 4
+```{r m280, results='asis'}
+m280 <- lme(HVraw ~ tmao_log +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption + prev.coronary.heart.disease + prev.stroke.tia
+          +prev.diabetes + creatinine.gfr,
+          random = ~1 | center, data=wgs,
+          na.action=na.exclude)
+
+print_lme_fixed(m280)
+```
+
+\newpage
+
+# Sensitivity analyses for TMAO with CoCo score change >= 1 SD
+
+## Long-term group
+
+### TMAO Quintiles
+
+```{r c1,results="asis", fig.width=12, fig.height=8}
+c11 <- coxph(Surv(time_to_CoCo_change, 
+                 as.numeric(as.character(CoCo_change))) ~ tmao_q 
+            + age.bl + pat.sex + highest.education.level.groups 
+            + gesundheitszustand + gds.total
+            + frailty(center), data = FUP3)
+
+c12 <- coxph(Surv(time_to_CoCo_change, 
+                 as.numeric(as.character(CoCo_change))) ~ tmao_q 
+            + age.bl + pat.sex + highest.education.level.groups 
+            + gesundheitszustand + gds.total 
+            + rauchen + bmi + prev.hypertonie + sport + total.alcohol.consumption
+             + frailty(center), data = FUP3) 
+
+c13 <- coxph(Surv(time_to_CoCo_change, 
+                 as.numeric(as.character(CoCo_change))) ~ tmao_q 
+            + age.bl + pat.sex + highest.education.level.groups 
+            + gesundheitszustand + gds.total 
+            + rauchen + bmi + prev.hypertonie + sport + total.alcohol.consumption 
+            + prev.coronary.heart.disease + prev.stroke.tia
+             + frailty(center), data = FUP3) 
+
+
+c14 <- coxph(Surv(time_to_CoCo_change, 
+                 as.numeric(as.character(CoCo_change))) ~ tmao_q 
+            + age.bl + pat.sex + highest.education.level.groups 
+            + gesundheitszustand + gds.total 
+            + rauchen + bmi + prev.hypertonie + sport + total.alcohol.consumption 
+            + prev.coronary.heart.disease + prev.stroke.tia
+            + prev.diabetes + creatinine.gfr
+            + frailty(center), data = FUP3) 
+
+
+# print table(s)
+print_cox_table(c11)
+print_cox_table(c12)
+print_cox_table(c13)
+print_cox_table(c14)
+
+```
+
+\newpage
+
+### TMAO continuous
+
+```{r c10,results="asis", fig.width=12, fig.height=8}
+
+c110 <- coxph(Surv(time_to_CoCo_change, 
+                 as.numeric(as.character(CoCo_change))) ~ tmao_log 
+            + age.bl + pat.sex + highest.education.level.groups 
+            + gesundheitszustand + gds.total
+            + frailty(center), data = FUP3)
+
+c120 <- coxph(Surv(time_to_CoCo_change, 
+                 as.numeric(as.character(CoCo_change))) ~ tmao_log 
+            + age.bl + pat.sex + highest.education.level.groups 
+            + gesundheitszustand + gds.total 
+            + rauchen + bmi + prev.hypertonie + sport + total.alcohol.consumption
+             + frailty(center), data = FUP3) 
+
+c130 <- coxph(Surv(time_to_CoCo_change, 
+                 as.numeric(as.character(CoCo_change))) ~ tmao_log 
+            + age.bl + pat.sex + highest.education.level.groups 
+            + gesundheitszustand + gds.total 
+            + rauchen + bmi + prev.hypertonie + sport + total.alcohol.consumption 
+            + prev.coronary.heart.disease + prev.stroke.tia
+             + frailty(center), data = FUP3) 
+
+c140 <- coxph(Surv(time_to_CoCo_change, 
+                 as.numeric(as.character(CoCo_change))) ~ tmao_log 
+            + age.bl + pat.sex + highest.education.level.groups 
+            + gesundheitszustand + gds.total 
+            + rauchen + bmi + prev.hypertonie + sport + total.alcohol.consumption 
+            + prev.coronary.heart.disease + prev.stroke.tia
+            + prev.diabetes + creatinine.gfr
+            + frailty(center), data = FUP3) 
+
+# print table(s)
+print_cox_table(c110)
+print_cox_table(c120)
+print_cox_table(c130)
+print_cox_table(c140)
+
+```
+
+\newpage
+
+## Short-term group
+
+No events of CoCo decline >= 1 SD
+
+\newpage
+
+# Association of TMAO with HV (Stroke subgroup analyses)
+
+Model 1 (Epidemiologic variables): Age, Sex, Level of education, Intracranial Volume (sbtiv.vol)    
+Model 2 (Modifiable cardiovascular risk factors): Model 1 + smoking, BMI, HT, Alcohol consumption, Physical activity    
+Model 3 (Cardiovascular events): Model 1 + Model 2 + Coronary artery disease 
+Model 4 (Metabolic variables): Model 1 + Model 2 + Model 3 + Diabetes status + eGFR  
+
+## Overt stroke
+
+### TMAO Continuous
+
+* Model 1
+```{r m60, results='asis'}
+m60 <- lme(HVraw ~ tmao_log +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups,
+          random = ~1|center, data=ddos,
+          na.action=na.exclude)
+
+print_lme_fixed(m60)
+```
+
+* Model 2
+```{r m70, results='asis'}
+m70 <- lme(HVraw ~ tmao_log  +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption,
+          random = ~1 | center, data=ddos,
+          na.action=na.exclude)
+
+print_lme_fixed(m70)
+```
+
+* Model 3
+```{r m80, results='asis'}
+m80 <- lme(HVraw ~ tmao_log +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption + prev.coronary.heart.disease,
+          random = ~1 | center, data=ddos,
+          na.action=na.exclude)
+
+print_lme_fixed(m80)
+```
+
+* Model 4
+```{r m90, results='asis'}
+m90 <- lme(HVraw ~ tmao_log +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption + prev.coronary.heart.disease 
+          +prev.diabetes + creatinine.gfr,
+          random = ~1 | center, data=ddos,
+          na.action=na.exclude)
+
+print_lme_fixed(m90)
+```
+
+\newpage
+
+## Silent stroke
+
+
+### TMAO Continuous
+
+* Model 1
+```{r m110, results='asis'}
+m110 <- lme(HVraw ~ tmao_log +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups,
+          random = ~1|center, data=ddss,
+          na.action=na.exclude)
+
+print_lme_fixed(m110)
+```
+
+* Model 2
+```{r m120, results='asis'}
+m120 <- lme(HVraw ~ tmao_log  +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption,
+          random = ~1 | center, data=ddss,
+          na.action=na.exclude)
+
+print_lme_fixed(m120)
+```
+
+* Model 3
+```{r m130, results='asis'}
+m130 <- lme(HVraw ~ tmao_log +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption + prev.coronary.heart.disease ,
+          random = ~1 | center, data=ddss,
+          na.action=na.exclude)
+
+print_lme_fixed(m130)
+```
+
+* Model 4
+```{r m140, results='asis'}
+m140 <- lme(HVraw ~ tmao_log +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption + prev.coronary.heart.disease 
+          +prev.diabetes + creatinine.gfr,
+          random = ~1 | center, data=ddss,
+          na.action=na.exclude)
+
+print_lme_fixed(m140)
+```
+
+\newpage
+
+## No stroke
+
+
+### TMAO Continuous
+
+* Model 1
+```{r m150, results='asis'}
+m150 <- lme(HVraw ~ tmao_log +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups,
+          random = ~1|center, data=ddns,
+          na.action=na.exclude)
+
+print_lme_fixed(m150)
+```
+
+* Model 2
+```{r m160, results='asis'}
+m160 <- lme(HVraw ~ tmao_log  +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption,
+          random = ~1 | center, data=ddns,
+          na.action=na.exclude)
+
+print_lme_fixed(m160)
+```
+
+* Model 3
+```{r m170, results='asis'}
+m170 <- lme(HVraw ~ tmao_log +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption + prev.coronary.heart.disease,
+          random = ~1 | center, data=ddns,
+          na.action=na.exclude)
+
+print_lme_fixed(m170)
+```
+
+* Model 4
+```{r m180, results='asis'}
+m180 <- lme(HVraw ~ tmao_log +age.bl+pat.sex+sbtiv.vol + highest.education.level.groups
+            + rauchen + bmi + prev.hypertonie + sport +
+            total.alcohol.consumption + prev.coronary.heart.disease 
+          +prev.diabetes + creatinine.gfr,
+          random = ~1 | center, data=ddns,
+          na.action=na.exclude)
+
+print_lme_fixed(m180)
+```
+
+\newpage

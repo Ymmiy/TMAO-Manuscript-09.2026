@@ -1,0 +1,229 @@
+---
+title: "Association between Trimethylamine N-Oxide (TMAO) and Neurofilament light polypeptide in Patients with Atrial Fibrillation"
+author: "P. Lee"
+date: "18.03.2025"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 4
+    number_sections: false
+  html_document:
+    toc: true
+    toc_depth: 4
+    df_print: paged
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  error = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  cache = FALSE
+)
+
+library(tidyverse)
+library(nlme)
+library(knitr)
+
+options(scipen = 999)
+
+# Fixed-effect table for nlme::lme models.
+# Uses nlme directly to avoid version-sensitive extraction of random-effect
+# variances by parameters/datawizard. Sample size is deliberately not printed.
+print_lme_fixed <- function(model, digits = 3) {
+  tt <- as.data.frame(summary(model)$tTable)
+  tt$Parameter <- rownames(tt)
+  rownames(tt) <- NULL
+
+  crit <- qt(0.975, df = tt$DF)
+  tt$CI_low <- tt$Value - crit * tt$Std.Error
+  tt$CI_high <- tt$Value + crit * tt$Std.Error
+
+  p_fmt <- ifelse(
+    is.na(tt$`p-value`),
+    NA_character_,
+    ifelse(
+      tt$`p-value` < 0.001,
+      "<0.001",
+      formatC(tt$`p-value`, format = "f", digits = digits)
+    )
+  )
+
+  out <- data.frame(
+    Parameter = tt$Parameter,
+    Estimate = round(tt$Value, digits),
+    SE = round(tt$Std.Error, digits),
+    `95% CI` = sprintf(
+      paste0("%.", digits, "f to %.", digits, "f"),
+      tt$CI_low, tt$CI_high
+    ),
+    DF = tt$DF,
+    `t value` = round(tt$`t-value`, digits),
+    `p value` = p_fmt,
+    check.names = FALSE
+  )
+
+  print(
+    knitr::kable(
+      out,
+      align = c("l", "r", "r", "c", "r", "r", "r")
+    )
+  )
+}
+```
+
+```{r data-wrangling}
+dd <- read_csv("Baseline.csv")
+
+dd <- dd %>%
+  mutate(tmao_q = as.factor(ntile(tmao,5)))
+dd$tmao_log <- log1p(dd$tmao )
+dd$tmao_q <- as.factor(dd$tmao_q)
+
+```
+
+\newpage
+
+# TMAO Quintiles and Neurofilament light polypeptide
+
+```{r table, results='asis'}
+ddq <- dd %>%
+  pivot_longer(cols=c(tmao_q),
+               names_to = "TMAO",values_to = "Quintiles")%>%
+  pivot_longer(cols = c(nfl),
+               names_to = "nfl",values_to = "Volumes")
+
+### Rearrange order of factor 
+ddq$Quintiles <- factor(ddq$Quintiles, 
+                       levels = c("1", "2", "3", "4", '5'))
+
+ddq <- ddq %>%
+  filter(!is.na(Quintiles)) %>%
+  filter(!is.na(Volumes))
+
+sddq <- ddq %>%
+  group_by(Quintiles, nfl, TMAO) %>%
+  summarise(n = n(), mean = mean(Volumes), sd = sd(Volumes), .groups = "drop")
+
+kable(sddq)
+
+```
+```{r boxplot, fig.show='asis', fig.width=8, fig.height=8}
+a<- ggplot(ddq, aes(x=Quintiles,y=Volumes,fill=Quintiles))+
+  geom_boxplot()+
+  xlab("") +
+  ylab("") +
+  ggtitle("Neurofilament light polypeptide") +
+  scale_fill_brewer(palette="YlOrRd") +
+  theme_bw()+
+  theme(legend.position = "none") +
+  theme(strip.text = element_text(color = "black")) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+a
+
+```
+
+\newpage
+
+# Association between TMAO and Neurofilament light polypeptide (Nfl)
+
+* Random Effects  
+Center  
+
+* Covariates  
+Model 1 (epidemiologic variables): age, sex  
+Model 2: (modifiable cardiovascular risk factors): Model 1 + BMI, hypertension  
+Model 3 (cardiovascular events): Model 1 + Model 2 + coronary artery disease, prev. stroke   
+Model 4 (metabolic variables): Model 1 + Model 2 + diabetes status, renal function (eGFR)  
+
+\newpage
+
+## TMAO quintiles
+
+* Model 1
+```{r m1, results='asis'}
+m1 <- lme(nfl ~ tmao_q + age.bl + pat.sex,
+          random = ~1 | center, data=dd,
+          na.action=na.exclude)
+
+print_lme_fixed(m1)
+```
+
+* Model 2
+```{r m2, results='asis'}
+m2 <- lme(nfl ~ tmao_q + age.bl + pat.sex +
+                 bmi + prev.hypertonie,
+          random = ~1 | center, data=dd,
+          na.action=na.exclude)
+
+print_lme_fixed(m2)
+```
+
+* Model 3
+```{r m3, results='asis'}
+m3 <- lme(nfl ~ tmao_q + age.bl + pat.sex +
+                 bmi + prev.hypertonie
+                 + prev.coronary.heart.disease + prev.stroke.tia,
+          random = ~1 | center, data=dd,
+          na.action=na.exclude)
+
+print_lme_fixed(m3)
+```
+
+* Model 4
+```{r m4, results='asis'}
+m4 <- lme(nfl ~ tmao_q + age.bl + pat.sex +
+                 bmi + prev.hypertonie
+                 + prev.diabetes + creatinine.gfr,
+          random = ~1 | center, data=dd,
+          na.action=na.exclude)
+
+print_lme_fixed(m4)
+```
+\newpage
+
+## TMAO Continuous
+
+* Model 1
+```{r m10, results='asis'}
+m10 <- lme(nfl ~ tmao_log + age.bl + pat.sex,
+          random = ~1 | center, data=dd,
+          na.action=na.exclude)
+
+print_lme_fixed(m10)
+```
+
+* Model 2
+```{r m20, results='asis'}
+m20 <- lme(nfl ~ tmao_log + age.bl + pat.sex +
+                 bmi + prev.hypertonie,
+          random = ~1 | center, data=dd,
+          na.action=na.exclude)
+
+print_lme_fixed(m20)
+```
+
+* Model 3
+```{r m30, results='asis'}
+m30 <- lme(nfl ~ tmao_log + age.bl + pat.sex +
+                 bmi + prev.hypertonie
+                 + prev.coronary.heart.disease + prev.stroke.tia,
+          random = ~1 | center, data=dd,
+          na.action=na.exclude)
+
+print_lme_fixed(m30)
+```
+
+* Model 4
+```{r m40, results='asis'}
+m40 <- lme(nfl ~ tmao_log + age.bl + pat.sex +
+                 bmi + prev.hypertonie
+                 + prev.diabetes + creatinine.gfr,
+          random = ~1 | center, data=dd,
+          na.action=na.exclude)
+
+print_lme_fixed(m40)
+```
