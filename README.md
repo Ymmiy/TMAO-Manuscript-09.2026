@@ -1,60 +1,61 @@
 # TMAO-Manuscript-09.2026
 Analysis code and figure-generation scripts for the TMAO project, including the original analyses and revised analyses updated in September 2026.
 
-# TMAO Analysis Code
+Files
 
-This repository contains the R code used for the statistical analyses and figure generation for our study investigating trimethylamine N-oxide (TMAO) in relation to neurological and cognitive outcomes.
+1. 01_TMAO_Longitudinal_Cognition.Rmd
+   - Longitudinal LME analyses for CoCo, MoCA, TMT-A, TMT-B, semantic fluency, and DSST.
+   - Six models: 1, 2, 3, 4a, 4b, 5.
+   - One ggfortify::autoplot() companion diagnostic for MoCA.
+   - 
+2. 02_TMAO_Cognitive_Events_Sensitivity_Subgroups.Rmd
+   - Time-to-event cognitive analyses.
+   - Long-term/short-term sensitivity analyses.
+   - Cognitive stroke-subgroup analyses from the supplied stroke file.
+   - Six models wherever the corresponding analysis was present in the supplied source.
+     
+3. 03_TMAO_Hippocampal_Volume.Rmd
+   - Bilateral, left, and right hippocampal-volume analyses.
+   - Stroke subgroup and long-term/short-term sensitivity analyses.
+   - Six models: 1, 2, 3, 4a, 4b, 5.
+   - One ggfortify::autoplot() companion diagnostic for bilateral HV.
+     
+4. 04_TMAO_NfL.Rmd
+   - NfL descriptive summary and mixed-effects models.
+   - Six models: 1, 2, 3, 4a, 4b, 5.
+   - One ggfortify::autoplot() companion diagnostic for NfL.
+     
+Model sequence
+Cognitive analyses
+- Model 1: age + sex + education + quality of life + GDS
+- Model 2: Model 1 + smoking + BMI + hypertension + physical activity + alcohol
+- Model 3: Model 2 + coronary artery disease + previous stroke/TIA
+- Model 4a: Model 3 + eGFR
+- Model 4b: Model 3 + diabetes
+- Model 5: Model 3 + diabetes + eGFR
+Hippocampal volume analyses
+- Model 1: age + sex + intracranial volume + education
+- Model 2: Model 1 + smoking + BMI + hypertension + physical activity + alcohol
+- Model 3: Model 2 + coronary artery disease + previous stroke/TIA
+- Model 4a: Model 3 + eGFR
+- Model 4b: Model 3 + diabetes
+- Model 5: Model 3 + diabetes + eGFR
+  
+For stroke-defined subgroup analyses, previous stroke/TIA is not included as an adjustment variable, matching the supplied subgroup scripts.
 
-The repository includes both the **original analysis code** and **revised analyses performed in September 2026**.
+NfL analyses
+- Model 1: age + sex
+- Model 2: Model 1 + BMI + hypertension
+- Model 3: Model 2 + coronary artery disease + previous stroke/TIA
+- Model 4a: Model 3 + eGFR
+- Model 4b: Model 3 + diabetes
+- Model 5: Model 3 + diabetes + eGFR
+- 
+Analysis N
+Each model set prints the complete-case participant N by fixed baseline TMAO quintile. Longitudinal models additionally report the number of contributing observations.
 
-## Repository structure
-
-Analyses with filenames containing **`09.2026`** represent the revised analyses performed in September 2026.
-
-Files without the `09.2026` designation correspond to the original analyses performed during earlier stages of the project.
-
-The revised analyses were performed to update and refine the statistical models, improve consistency across outcomes and sensitivity analyses, and address methodological and code-related issues identified during manuscript revision.
-
-## Main analyses
-
-The repository includes analyses examining the association of TMAO with:
-
-- cognitive function and longitudinal cognitive change;
-- incident cognitive impairment;
-- hippocampal volume;
-- neurofilament light chain (NFL);
-- stroke-related subgroups and sensitivity analyses.
-
-The cognitive outcomes analysed include:
-
-- Montreal Cognitive Assessment (MoCA);
-- Cognitive Construct score (CoCo);
-- Trail Making Test A (TMT-A);
-- Trail Making Test B (TMT-B);
-- Semantic Fluency (SF);
-- Digit Symbol Substitution Test (DSST).
-
-## Revised analyses: September 2026
-
-Files labelled with **`09.2026`** contain the revised analysis code.
-
-These revisions include, where applicable:
-
-- updated mixed-effects model specifications;
-- sensitivity analyses;
-- stroke subgroup analyses;
-- updated Cox proportional hazards analyses;
-- revised Kaplan–Meier analyses.
-
-For longitudinal continuous TMAO analyses, interaction models use:
-
-## Original analyses
-
-Files that do **not** contain `09.2026` represent the original analysis code.
-
-These files are retained for transparency and reproducibility and document the analytical workflow used during earlier stages of the project.
-
-Because the analyses evolved during manuscript preparation and revision, the September 2026 files should be considered the **most recent analysis versions** where corresponding revised files are available.
+Diagnostics
+The requested ggfortify::autoplot() check is included once for MoCA, bilateral hippocampal volume, and NfL. These are companion lm diagnostics. Primary inference remains based on the nlme::lme models.
 
 ## Figures
 
@@ -125,7 +126,6 @@ FUP3.long.csv
 WGS.csv
 WGS.long.csv
 ```
-These files should be stored locally and must not be committed to a public repository.
 
 ## Software
 
@@ -145,14 +145,6 @@ The individual-level study data are not publicly distributed through this reposi
 
 Access to the underlying data is subject to the applicable study governance, ethical approvals, and data-sharing requirements.
 
-## Versioning
-
-For clarity:
-
-- **Files containing `09.2026`**: revised analyses performed in September 2026.
-- **Files without `09.2026`**: original analyses retained for transparency and documentation of the analytical history.
-
-Where both an original and a September 2026 version exist, the **September 2026 version supersedes the earlier analysis for the corresponding revised analysis**.
 
 ## Contact
 
