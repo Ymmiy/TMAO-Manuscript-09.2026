@@ -1,0 +1,397 @@
+---
+title: "TMAO and longitudinal cognitive function"
+author: "P. Lee"
+date: "September 2026 revision"
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 4
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, error = FALSE, message = FALSE, warning = FALSE, cache = FALSE)
+
+library(dplyr)
+library(readr)
+library(nlme)
+library(knitr)
+library(ggplot2)
+library(ggfortify)
+
+options(scipen = 999)
+
+# Fixed-effect table for nlme::lme models.
+print_lme_fixed <- function(model, digits = 3) {
+  tt <- as.data.frame(summary(model)$tTable)
+  tt$Parameter <- rownames(tt)
+  rownames(tt) <- NULL
+
+  crit <- qt(0.975, df = tt$DF)
+  tt$CI_low <- tt$Value - crit * tt$Std.Error
+  tt$CI_high <- tt$Value + crit * tt$Std.Error
+
+  p_fmt <- ifelse(
+    is.na(tt$`p-value`),
+    NA_character_,
+    ifelse(
+      tt$`p-value` < 0.001,
+      "<0.001",
+      formatC(tt$`p-value`, format = "f", digits = digits)
+    )
+  )
+
+  out <- data.frame(
+    Parameter = tt$Parameter,
+    Estimate = round(tt$Value, digits),
+    SE = round(tt$Std.Error, digits),
+    `95% CI` = sprintf(
+      paste0("%.", digits, "f to %.", digits, "f"),
+      tt$CI_low, tt$CI_high
+    ),
+    DF = tt$DF,
+    `t value` = round(tt$`t-value`, digits),
+    `p value` = p_fmt,
+    check.names = FALSE
+  )
+
+  print(knitr::kable(out, align = c("l", "r", "r", "c", "r", "r", "r")))
+}
+
+model_n_by_quintile <- function(model, data, id = "pat.id", quintile = "tmao_q",
+                                extra_vars = character()) {
+  vars <- unique(c(all.vars(formula(model)), id, quintile, extra_vars))
+  vars <- vars[vars %in% names(data)]
+
+  used <- data %>%
+    filter(if_all(all_of(vars), ~ !is.na(.x)))
+
+  used %>%
+    group_by(.data[[quintile]]) %>%
+    summarise(
+      N_patients = n_distinct(.data[[id]]),
+      N_observations = n(),
+      .groups = "drop"
+    )
+}
+
+print_model_set <- function(models) {
+  for (nm in names(models)) {
+    cat("\n\n#### ", nm, "\n\n", sep = "")
+    print_lme_fixed(models[[nm]])
+  }
+}
+
+print_model_n_set <- function(models, data, extra_vars = character()) {
+  out <- bind_rows(lapply(names(models), function(nm) {
+    model_n_by_quintile(models[[nm]], data = data, extra_vars = extra_vars) %>%
+      mutate(Model = nm, .before = 1)
+  }))
+  print(knitr::kable(out))
+}
+
+```
+
+# Data preparation
+
+```{r data-preparation, results='asis'}
+
+baseline_raw <- read_csv("Baseline.csv", show_col_types = FALSE)
+
+baseline_tmao <- baseline_raw %>%
+  transmute(
+    pat.id = as.character(pat.id),
+    tmao_q = as.factor(tmao_q)
+  ) %>%
+  distinct()
+
+if (anyDuplicated(baseline_tmao$pat.id)) {
+  stop("Baseline.csv contains more than one TMAO-quintile value for at least one pat.id.")
+}
+
+attach_baseline_tmao_q <- function(data, baseline_lookup = baseline_tmao) {
+  data %>%
+    mutate(pat.id = as.character(pat.id)) %>%
+    select(-any_of("tmao_q")) %>%
+    left_join(baseline_lookup, by = "pat.id")
+}
+
+check_tmao_q_fixed <- function(data, dataset_name = deparse(substitute(data))) {
+  changing <- data %>%
+    filter(!is.na(tmao_q)) %>%
+    group_by(pat.id) %>%
+    summarise(n_tmao_q = n_distinct(tmao_q), .groups = "drop") %>%
+    filter(n_tmao_q > 1)
+
+  if (nrow(changing) > 0) {
+    stop(dataset_name, ": tmao_q is not fixed within participant.")
+  }
+  invisible(TRUE)
+}
+
+baseline_tmao %>%
+  count(tmao_q, name = "N") %>%
+  knitr::kable()
+
+factor_vars <- c(
+  "pat.id", "visit.name", "pat.sex", "vhf.typ.aktuell.bl", "rauchen",
+  "stop.grund", "prev.hypertonie", "prev.diabetes", "prev.stroke.tia",
+  "prev.coronary.heart.disease", "sport", "highest.education.level.groups",
+  "type_of_lesion", "dementia", "cog_impairment", "MoCA_change",
+  "CoCo_change", "DSST_change", "SF_change", "TMTA_change", "TMTB_change"
+)
+
+factorise_analysis_vars <- function(data) {
+  data %>% mutate(across(any_of(factor_vars), as.factor))
+}
+
+fill_baseline_egfr <- function(data) {
+  data %>%
+    group_by(pat.id) %>%
+    mutate(
+      baseline_creatinine = dplyr::first(
+        creatinine.gfr[as.character(visit.name) == "Baseline"],
+        default = NA_real_
+      ),
+      creatinine.gfr = ifelse(
+        is.na(creatinine.gfr), baseline_creatinine, creatinine.gfr
+      )
+    ) %>%
+    ungroup() %>%
+    select(-baseline_creatinine)
+}
+
+
+dd <- read_csv("Fu5.csv", show_col_types = FALSE) %>%
+  attach_baseline_tmao_q() %>%
+  mutate(tmao_log = log1p(tmao)) %>%
+  factorise_analysis_vars() %>%
+  fill_baseline_egfr()
+
+check_tmao_q_fixed(dd, "Fu5.csv")
+```
+
+# Model definitions
+
+The six adjustment models retain the original Models 1–3 and incorporate the September 2026 metabolic updates:
+
+- **Model 1:** age, sex, education, quality of life, GDS.
+- **Model 2:** Model 1 + smoking, BMI, hypertension, physical activity, alcohol.
+- **Model 3:** Model 2 + coronary artery disease, previous stroke/TIA.
+- **Model 4a:** Model 3 + eGFR.
+- **Model 4b:** Model 3 + diabetes.
+- **Model 5:** Model 3 + diabetes + eGFR.
+
+```{r model-specification}
+
+cog_covariates <- list(
+  "Model 1" = c(
+    "age.bl", "pat.sex", "highest.education.level.groups",
+    "gesundheitszustand", "gds.total"
+  ),
+  "Model 2" = c(
+    "age.bl", "pat.sex", "highest.education.level.groups",
+    "gesundheitszustand", "gds.total",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption"
+  ),
+  "Model 3" = c(
+    "age.bl", "pat.sex", "highest.education.level.groups",
+    "gesundheitszustand", "gds.total",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease", "prev.stroke.tia"
+  ),
+  "Model 4a" = c(
+    "age.bl", "pat.sex", "highest.education.level.groups",
+    "gesundheitszustand", "gds.total",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease", "prev.stroke.tia", "creatinine.gfr"
+  ),
+  "Model 4b" = c(
+    "age.bl", "pat.sex", "highest.education.level.groups",
+    "gesundheitszustand", "gds.total",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease", "prev.stroke.tia", "prev.diabetes"
+  ),
+  "Model 5" = c(
+    "age.bl", "pat.sex", "highest.education.level.groups",
+    "gesundheitszustand", "gds.total",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease", "prev.stroke.tia",
+    "prev.diabetes", "creatinine.gfr"
+  )
+)
+
+build_longitudinal_formula <- function(outcome, exposure, covariates) {
+  rhs <- c(
+    "time_since_first",
+    exposure,
+    paste0("time_since_first:", exposure),
+    covariates
+  )
+  as.formula(paste(outcome, "~", paste(rhs, collapse = " + ")))
+}
+
+fit_cognitive_lme_set <- function(outcome, exposure, data,
+                                  random = ~ time_since_first | center/pat.id,
+                                  covariates = cog_covariates) {
+  setNames(lapply(names(covariates), function(nm) {
+    nlme::lme(
+      fixed = build_longitudinal_formula(outcome, exposure, covariates[[nm]]),
+      random = random,
+      data = data,
+      na.action = na.exclude
+    )
+  }), names(covariates))
+}
+
+```
+
+# Association between TMAO and overall cognitive function over time
+
+All primary models are linear mixed-effects models with a random intercept and random slope for time nested within centre/patient, as in the supplied longitudinal analysis.
+
+## CoCo score
+
+### TMAO quintiles
+
+```{r coco-quintile, results='asis'}
+coco_q <- fit_cognitive_lme_set("CoCo", "tmao_q", dd)
+print_model_set(coco_q)
+
+cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(coco_q, dd, extra_vars = c("center", "pat.id"))
+```
+
+### TMAO continuous
+
+```{r coco-continuous, results='asis'}
+coco_cont <- fit_cognitive_lme_set("CoCo", "tmao_log", dd)
+print_model_set(coco_cont)
+
+cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(coco_cont, dd, extra_vars = c("center", "pat.id"))
+```
+
+## MoCA score
+
+### TMAO quintiles
+
+```{r moca-quintile, results='asis'}
+moca_q <- fit_cognitive_lme_set("MoCA", "tmao_q", dd)
+print_model_set(moca_q)
+
+cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(moca_q, dd, extra_vars = c("center", "pat.id"))
+```
+
+### TMAO continuous
+
+```{r moca-continuous, results='asis'}
+moca_cont <- fit_cognitive_lme_set("MoCA", "tmao_log", dd)
+print_model_set(moca_cont)
+
+cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(moca_cont, dd, extra_vars = c("center", "pat.id"))
+```
+
+### One diagnostic plot for MoCA
+
+`autoplot()` is applied to a fixed-effects-only `lm` companion model.
+
+```{r moca-autoplot, fig.width=10, fig.height=8}
+moca_diag_formula <- build_longitudinal_formula(
+  "MoCA", "tmao_q", cog_covariates[["Model 5"]]
+)
+
+moca_diag_lm <- lm(
+  formula = moca_diag_formula,
+  data = dd,
+  na.action = na.exclude
+)
+
+autoplot(moca_diag_lm, which = c(1, 2, 3, 5), ncol = 2)
+```
+
+## TMT-A score
+
+### TMAO quintiles
+
+```{r tmta-quintile, results='asis'}
+tmta_q <- fit_cognitive_lme_set("TMTA", "tmao_q", dd)
+print_model_set(tmta_q)
+cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(tmta_q, dd, extra_vars = c("center", "pat.id"))
+```
+
+### TMAO continuous
+
+```{r tmta-continuous, results='asis'}
+tmta_cont <- fit_cognitive_lme_set("TMTA", "tmao_log", dd)
+print_model_set(tmta_cont)
+cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(tmta_cont, dd, extra_vars = c("center", "pat.id"))
+```
+
+## TMT-B score
+
+### TMAO quintiles
+
+```{r tmtb-quintile, results='asis'}
+tmtb_q <- fit_cognitive_lme_set("TMTB", "tmao_q", dd)
+print_model_set(tmtb_q)
+cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(tmtb_q, dd, extra_vars = c("center", "pat.id"))
+```
+
+### TMAO continuous
+
+```{r tmtb-continuous, results='asis'}
+tmtb_cont <- fit_cognitive_lme_set("TMTB", "tmao_log", dd)
+print_model_set(tmtb_cont)
+cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(tmtb_cont, dd, extra_vars = c("center", "pat.id"))
+```
+
+## Semantic fluency score
+
+### TMAO quintiles
+
+```{r sf-quintile, results='asis'}
+sf_q <- fit_cognitive_lme_set("SF", "tmao_q", dd)
+print_model_set(sf_q)
+cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(sf_q, dd, extra_vars = c("center", "pat.id"))
+```
+
+### TMAO continuous
+
+```{r sf-continuous, results='asis'}
+sf_cont <- fit_cognitive_lme_set("SF", "tmao_log", dd)
+print_model_set(sf_cont)
+cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(sf_cont, dd, extra_vars = c("center", "pat.id"))
+```
+
+## DSST score
+
+### TMAO quintiles
+
+```{r dsst-quintile, results='asis'}
+dsst_q <- fit_cognitive_lme_set("DSST", "tmao_q", dd)
+print_model_set(dsst_q)
+cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(dsst_q, dd, extra_vars = c("center", "pat.id"))
+```
+
+### TMAO continuous
+
+```{r dsst-continuous, results='asis'}
+dsst_cont <- fit_cognitive_lme_set("DSST", "tmao_log", dd)
+print_model_set(dsst_cont)
+cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(dsst_cont, dd, extra_vars = c("center", "pat.id"))
+```

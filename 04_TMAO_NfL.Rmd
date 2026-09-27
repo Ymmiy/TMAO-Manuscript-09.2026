@@ -1,0 +1,273 @@
+---
+title: "TMAO and neurofilament light polypeptide"
+author: "P. Lee"
+date: "September 2026 revision"
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 4
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, error = FALSE, message = FALSE, warning = FALSE, cache = FALSE)
+
+library(dplyr)
+library(readr)
+library(tidyr)
+library(nlme)
+library(knitr)
+library(ggplot2)
+library(ggfortify)
+
+options(scipen = 999)
+
+# Fixed-effect table for nlme::lme models.
+print_lme_fixed <- function(model, digits = 3) {
+  tt <- as.data.frame(summary(model)$tTable)
+  tt$Parameter <- rownames(tt)
+  rownames(tt) <- NULL
+
+  crit <- qt(0.975, df = tt$DF)
+  tt$CI_low <- tt$Value - crit * tt$Std.Error
+  tt$CI_high <- tt$Value + crit * tt$Std.Error
+
+  p_fmt <- ifelse(
+    is.na(tt$`p-value`),
+    NA_character_,
+    ifelse(
+      tt$`p-value` < 0.001,
+      "<0.001",
+      formatC(tt$`p-value`, format = "f", digits = digits)
+    )
+  )
+
+  out <- data.frame(
+    Parameter = tt$Parameter,
+    Estimate = round(tt$Value, digits),
+    SE = round(tt$Std.Error, digits),
+    `95% CI` = sprintf(
+      paste0("%.", digits, "f to %.", digits, "f"),
+      tt$CI_low, tt$CI_high
+    ),
+    DF = tt$DF,
+    `t value` = round(tt$`t-value`, digits),
+    `p value` = p_fmt,
+    check.names = FALSE
+  )
+
+  print(knitr::kable(out, align = c("l", "r", "r", "c", "r", "r", "r")))
+}
+
+model_n_by_quintile <- function(model, data, id = "pat.id", quintile = "tmao_q",
+                                extra_vars = character()) {
+  vars <- unique(c(all.vars(formula(model)), id, quintile, extra_vars))
+  vars <- vars[vars %in% names(data)]
+
+  used <- data %>%
+    filter(if_all(all_of(vars), ~ !is.na(.x)))
+
+  used %>%
+    group_by(.data[[quintile]]) %>%
+    summarise(
+      N = n_distinct(.data[[id]]),
+      .groups = "drop"
+    )
+}
+
+print_model_set <- function(models) {
+  for (nm in names(models)) {
+    cat("\n\n#### ", nm, "\n\n", sep = "")
+    print_lme_fixed(models[[nm]])
+  }
+}
+
+print_model_n_set <- function(models, data, extra_vars = character()) {
+  out <- bind_rows(lapply(names(models), function(nm) {
+    model_n_by_quintile(
+      models[[nm]],
+      data = data,
+      extra_vars = extra_vars
+    ) %>%
+      mutate(Model = nm, .before = 1)
+  }))
+
+  print(knitr::kable(
+    out,
+    col.names = c("Model", "TMAO quintile", "N")
+  ))
+}
+
+```
+
+# Data preparation
+
+```{r data-preparation, results='asis'}
+# follow-up, subgroup, or sensitivity-analysis datasets.
+baseline_raw <- read_csv("Baseline.csv", show_col_types = FALSE)
+
+baseline_tmao <- baseline_raw %>%
+  transmute(
+    pat.id = as.character(pat.id),
+    tmao_q = as.factor(tmao_q)
+  ) %>%
+  distinct()
+
+if (anyDuplicated(baseline_tmao$pat.id)) {
+  stop("Baseline.csv contains more than one TMAO-quintile value for at least one pat.id.")
+}
+
+attach_baseline_tmao_q <- function(data, baseline_lookup = baseline_tmao) {
+  data %>%
+    mutate(pat.id = as.character(pat.id)) %>%
+    select(-any_of("tmao_q")) %>%
+    left_join(baseline_lookup, by = "pat.id")
+}
+
+check_tmao_q_fixed <- function(data, dataset_name = deparse(substitute(data))) {
+  changing <- data %>%
+    filter(!is.na(tmao_q)) %>%
+    group_by(pat.id) %>%
+    summarise(n_tmao_q = n_distinct(tmao_q), .groups = "drop") %>%
+    filter(n_tmao_q > 1)
+
+  if (nrow(changing) > 0) {
+    stop(dataset_name, ": tmao_q is not fixed within participant.")
+  }
+  invisible(TRUE)
+}
+
+# Baseline quintile counts used in the manuscript cohort.
+baseline_tmao %>%
+  count(tmao_q, name = "N") %>%
+  knitr::kable()
+
+
+dd <- baseline_raw %>%
+  mutate(
+    pat.id = as.character(pat.id),
+    tmao_q = as.factor(tmao_q),
+    tmao_log = log1p(tmao)
+  )
+
+check_tmao_q_fixed(dd, "Baseline.csv")
+```
+
+# Descriptive NfL distribution by baseline TMAO quintile
+
+```{r nfl-description, results='asis'}
+nfl_summary <- dd %>%
+  filter(!is.na(tmao_q), !is.na(nfl)) %>%
+  group_by(tmao_q) %>%
+  summarise(
+    N = n_distinct(pat.id),
+    mean = mean(nfl),
+    sd = sd(nfl),
+    .groups = "drop"
+  )
+
+knitr::kable(nfl_summary)
+```
+
+```{r nfl-boxplot, fig.width=7, fig.height=5}
+ggplot(dd %>% filter(!is.na(tmao_q), !is.na(nfl)),
+       aes(x = tmao_q, y = nfl, fill = tmao_q)) +
+  geom_boxplot() +
+  labs(
+    x = "Baseline TMAO quintile",
+    y = "Neurofilament light polypeptide",
+    title = "NfL according to baseline TMAO quintile"
+  ) +
+  scale_fill_brewer(palette = "YlOrRd") +
+  ylim(0, 200) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+# Association between TMAO and NfL
+
+- **Model 1:** age, sex.
+- **Model 2:** Model 1 + BMI, hypertension.
+- **Model 3:** Model 2 + coronary artery disease, previous stroke/TIA.
+- **Model 4a:** Model 3 + eGFR.
+- **Model 4b:** Model 3 + diabetes.
+- **Model 5:** Model 3 + diabetes + eGFR.
+
+```{r model-specification}
+nfl_covariates <- list(
+  "Model 1" = c("age.bl", "pat.sex"),
+  "Model 2" = c("age.bl", "pat.sex", "bmi", "prev.hypertonie"),
+  "Model 3" = c(
+    "age.bl", "pat.sex", "bmi", "prev.hypertonie",
+    "prev.coronary.heart.disease", "prev.stroke.tia"
+  ),
+  "Model 4a" = c(
+    "age.bl", "pat.sex", "bmi", "prev.hypertonie",
+    "prev.coronary.heart.disease", "prev.stroke.tia", "creatinine.gfr"
+  ),
+  "Model 4b" = c(
+    "age.bl", "pat.sex", "bmi", "prev.hypertonie",
+    "prev.coronary.heart.disease", "prev.stroke.tia", "prev.diabetes"
+  ),
+  "Model 5" = c(
+    "age.bl", "pat.sex", "bmi", "prev.hypertonie",
+    "prev.coronary.heart.disease", "prev.stroke.tia",
+    "prev.diabetes", "creatinine.gfr"
+  )
+)
+
+build_nfl_formula <- function(exposure, covariates) {
+  as.formula(
+    paste("nfl ~", paste(c(exposure, covariates), collapse = " + "))
+  )
+}
+
+fit_nfl_set <- function(exposure, data = dd) {
+  setNames(lapply(names(nfl_covariates), function(nm) {
+    nlme::lme(
+      fixed = build_nfl_formula(exposure, nfl_covariates[[nm]]),
+      random = ~ 1 | center,
+      data = data,
+      na.action = na.exclude
+    )
+  }), names(nfl_covariates))
+}
+```
+
+## TMAO quintiles
+
+```{r nfl-quintile, results='asis'}
+nfl_q <- fit_nfl_set("tmao_q")
+print_model_set(nfl_q)
+cat("\n\n### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(nfl_q, dd, extra_vars = "center")
+```
+
+## TMAO continuous
+
+```{r nfl-continuous, results='asis'}
+nfl_cont <- fit_nfl_set("tmao_log")
+print_model_set(nfl_cont)
+cat("\n\n### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(nfl_cont, dd, extra_vars = "center")
+```
+
+## One diagnostic plot for NfL
+
+```{r nfl-autoplot, fig.width=10, fig.height=8}
+nfl_diag_lm <- lm(
+  formula = build_nfl_formula("tmao_q", nfl_covariates[["Model 5"]]),
+  data = dd,
+  na.action = na.exclude
+)
+
+autoplot(nfl_diag_lm, which = c(1, 2, 3, 5), ncol = 2)
+```

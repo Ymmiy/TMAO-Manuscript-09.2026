@@ -1,0 +1,590 @@
+---
+title: "TMAO and cognitive decline: survival, sensitivity, and stroke-subgroup analyses"
+author: "P. Lee"
+date: "September 2026 revision"
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 4
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, error = FALSE, message = FALSE, warning = FALSE, cache = FALSE)
+
+library(dplyr)
+library(readr)
+library(nlme)
+library(survival)
+library(knitr)
+
+options(scipen = 999)
+
+# Fixed-effect table for nlme::lme models.
+print_lme_fixed <- function(model, digits = 3) {
+  tt <- as.data.frame(summary(model)$tTable)
+  tt$Parameter <- rownames(tt)
+  rownames(tt) <- NULL
+
+  crit <- qt(0.975, df = tt$DF)
+  tt$CI_low <- tt$Value - crit * tt$Std.Error
+  tt$CI_high <- tt$Value + crit * tt$Std.Error
+
+  p_fmt <- ifelse(
+    is.na(tt$`p-value`),
+    NA_character_,
+    ifelse(
+      tt$`p-value` < 0.001,
+      "<0.001",
+      formatC(tt$`p-value`, format = "f", digits = digits)
+    )
+  )
+
+  out <- data.frame(
+    Parameter = tt$Parameter,
+    Estimate = round(tt$Value, digits),
+    SE = round(tt$Std.Error, digits),
+    `95% CI` = sprintf(
+      paste0("%.", digits, "f to %.", digits, "f"),
+      tt$CI_low, tt$CI_high
+    ),
+    DF = tt$DF,
+    `t value` = round(tt$`t-value`, digits),
+    `p value` = p_fmt,
+    check.names = FALSE
+  )
+
+  print(knitr::kable(out, align = c("l", "r", "r", "c", "r", "r", "r")))
+}
+
+model_n_by_quintile <- function(model, data, id = "pat.id", quintile = "tmao_q",
+                                extra_vars = character()) {
+  vars <- unique(c(all.vars(formula(model)), id, quintile, extra_vars))
+  vars <- vars[vars %in% names(data)]
+
+  used <- data %>%
+    filter(if_all(all_of(vars), ~ !is.na(.x)))
+
+  used %>%
+    group_by(.data[[quintile]]) %>%
+    summarise(
+      N_patients = n_distinct(.data[[id]]),
+      N_observations = n(),
+      .groups = "drop"
+    )
+}
+
+print_model_set <- function(models) {
+  for (nm in names(models)) {
+    cat("\n\n#### ", nm, "\n\n", sep = "")
+    print_lme_fixed(models[[nm]])
+  }
+}
+
+print_model_n_set <- function(models, data, extra_vars = character()) {
+  out <- bind_rows(lapply(names(models), function(nm) {
+    model_n_by_quintile(models[[nm]], data = data, extra_vars = extra_vars) %>%
+      mutate(Model = nm, .before = 1)
+  }))
+  print(knitr::kable(out))
+}
+
+# Numeric fixed-effect table for survival::coxph models.
+print_cox_table <- function(model, digits = 3) {
+  beta <- stats::coef(model)
+  vc <- stats::vcov(model)
+  se <- sqrt(diag(vc))
+  z <- beta / se
+  p <- 2 * stats::pnorm(abs(z), lower.tail = FALSE)
+  lower <- beta - stats::qnorm(0.975) * se
+  upper <- beta + stats::qnorm(0.975) * se
+
+  fmt_num <- function(x) formatC(x, format = "f", digits = digits)
+  fmt_p <- function(x) ifelse(
+    is.na(x), NA_character_,
+    ifelse(x < 0.001, "<0.001", formatC(x, format = "f", digits = digits))
+  )
+
+  out <- data.frame(
+    Parameter = names(beta),
+    HR = fmt_num(exp(beta)),
+    `95% CI` = paste0(fmt_num(exp(lower)), " to ", fmt_num(exp(upper))),
+    `p value` = fmt_p(p),
+    check.names = FALSE,
+    row.names = NULL
+  )
+
+  print(knitr::kable(out, align = c("l", "r", "c", "r")))
+}
+
+print_cox_set <- function(models) {
+  for (nm in names(models)) {
+    cat("\n\n#### ", nm, "\n\n", sep = "")
+    print_cox_table(models[[nm]])
+  }
+}
+
+```
+
+# Data preparation
+
+```{r data-preparation, results='asis'}
+
+# September 2026 correction:
+# TMAO quintile is a BASELINE exposure. It is never recalculated in longitudinal,
+# follow-up, subgroup, or sensitivity-analysis datasets.
+baseline_raw <- read_csv("Baseline.csv", show_col_types = FALSE)
+
+baseline_tmao <- baseline_raw %>%
+  transmute(
+    pat.id = as.character(pat.id),
+    tmao_q = as.factor(tmao_q)
+  ) %>%
+  distinct()
+
+if (anyDuplicated(baseline_tmao$pat.id)) {
+  stop("Baseline.csv contains more than one TMAO-quintile value for at least one pat.id.")
+}
+
+attach_baseline_tmao_q <- function(data, baseline_lookup = baseline_tmao) {
+  data %>%
+    mutate(pat.id = as.character(pat.id)) %>%
+    select(-any_of("tmao_q")) %>%
+    left_join(baseline_lookup, by = "pat.id")
+}
+
+check_tmao_q_fixed <- function(data, dataset_name = deparse(substitute(data))) {
+  changing <- data %>%
+    filter(!is.na(tmao_q)) %>%
+    group_by(pat.id) %>%
+    summarise(n_tmao_q = n_distinct(tmao_q), .groups = "drop") %>%
+    filter(n_tmao_q > 1)
+
+  if (nrow(changing) > 0) {
+    stop(dataset_name, ": tmao_q is not fixed within participant.")
+  }
+  invisible(TRUE)
+}
+
+# Baseline quintile counts used in the manuscript cohort.
+baseline_tmao %>%
+  count(tmao_q, name = "N") %>%
+  knitr::kable()
+
+factor_vars <- c(
+  "pat.id", "visit.name", "pat.sex", "vhf.typ.aktuell.bl", "rauchen",
+  "stop.grund", "prev.hypertonie", "prev.diabetes", "prev.stroke.tia",
+  "prev.coronary.heart.disease", "sport", "highest.education.level.groups",
+  "type_of_lesion", "dementia", "cog_impairment", "MoCA_change",
+  "CoCo_change", "DSST_change", "SF_change", "TMTA_change", "TMTB_change"
+)
+
+factorise_analysis_vars <- function(data) {
+  data %>% mutate(across(any_of(factor_vars), as.factor))
+}
+
+# As in the September 2026 analysis, carry the baseline eGFR value to rows
+# where longitudinal creatinine.gfr is missing.
+fill_baseline_egfr <- function(data) {
+  data %>%
+    group_by(pat.id) %>%
+    mutate(
+      baseline_creatinine = dplyr::first(
+        creatinine.gfr[as.character(visit.name) == "Baseline"],
+        default = NA_real_
+      ),
+      creatinine.gfr = ifelse(
+        is.na(creatinine.gfr), baseline_creatinine, creatinine.gfr
+      )
+    ) %>%
+    ungroup() %>%
+    select(-baseline_creatinine)
+}
+
+
+dd <- read_csv("Fu5.csv", show_col_types = FALSE) %>%
+  attach_baseline_tmao_q() %>%
+  mutate(tmao_log = log1p(tmao)) %>%
+  factorise_analysis_vars() %>%
+  fill_baseline_egfr()
+
+FUP3 <- read_csv("FUP3.long.csv", show_col_types = FALSE) %>%
+  attach_baseline_tmao_q() %>%
+  mutate(tmao_log = log1p(tmao)) %>%
+  factorise_analysis_vars() %>%
+  fill_baseline_egfr()
+
+WGS <- read_csv("WGS.long.csv", show_col_types = FALSE) %>%
+  attach_baseline_tmao_q() %>%
+  mutate(tmao_log = log1p(tmao)) %>%
+  factorise_analysis_vars() %>%
+  fill_baseline_egfr()
+
+WGS$time_to_CoCo_change <- as.numeric(WGS$time_to_CoCo_change)
+
+check_tmao_q_fixed(dd, "Fu5.csv")
+check_tmao_q_fixed(FUP3, "FUP3.long.csv")
+check_tmao_q_fixed(WGS, "WGS.long.csv")
+```
+
+# Model definitions
+
+```{r model-specification}
+
+cog_covariates <- list(
+  "Model 1" = c(
+    "age.bl", "pat.sex", "highest.education.level.groups",
+    "gesundheitszustand", "gds.total"
+  ),
+  "Model 2" = c(
+    "age.bl", "pat.sex", "highest.education.level.groups",
+    "gesundheitszustand", "gds.total",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption"
+  ),
+  "Model 3" = c(
+    "age.bl", "pat.sex", "highest.education.level.groups",
+    "gesundheitszustand", "gds.total",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease", "prev.stroke.tia"
+  ),
+  "Model 4a" = c(
+    "age.bl", "pat.sex", "highest.education.level.groups",
+    "gesundheitszustand", "gds.total",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease", "prev.stroke.tia", "creatinine.gfr"
+  ),
+  "Model 4b" = c(
+    "age.bl", "pat.sex", "highest.education.level.groups",
+    "gesundheitszustand", "gds.total",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease", "prev.stroke.tia", "prev.diabetes"
+  ),
+  "Model 5" = c(
+    "age.bl", "pat.sex", "highest.education.level.groups",
+    "gesundheitszustand", "gds.total",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease", "prev.stroke.tia",
+    "prev.diabetes", "creatinine.gfr"
+  )
+)
+
+build_longitudinal_formula <- function(outcome, exposure, covariates) {
+  rhs <- c(
+    "time_since_first",
+    exposure,
+    paste0("time_since_first:", exposure),
+    covariates
+  )
+  as.formula(paste(outcome, "~", paste(rhs, collapse = " + ")))
+}
+
+fit_cognitive_lme_set <- function(outcome, exposure, data,
+                                  random = ~ time_since_first | center/pat.id,
+                                  covariates = cog_covariates) {
+  setNames(lapply(names(covariates), function(nm) {
+    nlme::lme(
+      fixed = build_longitudinal_formula(outcome, exposure, covariates[[nm]]),
+      random = random,
+      data = data,
+      na.action = na.exclude
+    )
+  }), names(covariates))
+}
+
+
+build_cox_formula <- function(time_var, event_var, exposure, covariates) {
+  lhs <- paste0(
+    "Surv(", time_var, ", as.numeric(as.character(", event_var, ")))"
+  )
+  rhs <- c(exposure, covariates, "frailty(center)")
+  as.formula(paste(lhs, "~", paste(rhs, collapse = " + ")))
+}
+
+fit_cox_set <- function(time_var, event_var, exposure, data,
+                        covariates = cog_covariates) {
+  setNames(lapply(names(covariates), function(nm) {
+    survival::coxph(
+      formula = build_cox_formula(
+        time_var, event_var, exposure, covariates[[nm]]
+      ),
+      data = data,
+      na.action = na.exclude,
+      model = TRUE
+    )
+  }), names(covariates))
+}
+
+print_cox_n_set <- function(models, data) {
+  out <- bind_rows(lapply(names(models), function(nm) {
+    model_n_by_quintile(
+      models[[nm]], data = data,
+      extra_vars = c("center", "pat.id")
+    ) %>% mutate(Model = nm, .before = 1)
+  }))
+  print(knitr::kable(out))
+}
+```
+
+# Association between TMAO and time to cognitive decline
+
+The same six covariate sets are used for all time-to-event outcomes.
+
+```{r event-runner, include=FALSE}
+run_event_analysis <- function(title, time_var, event_var, data = dd) {
+  cat("\n\n## ", title, "\n\n", sep = "")
+
+  cat("\n\n### TMAO quintiles\n\n")
+  q_models <- fit_cox_set(time_var, event_var, "tmao_q", data)
+  print_cox_set(q_models)
+  cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+  print_cox_n_set(q_models, data)
+
+  cat("\n\n### TMAO continuous\n\n")
+  c_models <- fit_cox_set(time_var, event_var, "tmao_log", data)
+  print_cox_set(c_models)
+  cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+  print_cox_n_set(c_models, data)
+
+  invisible(list(quintile = q_models, continuous = c_models))
+}
+```
+
+```{r main-events, results='asis'}
+event_mci <- run_event_analysis(
+  "Mild cognitive impairment (MoCA < 26)",
+  "time_to_cog_impairment", "cog_impairment", dd
+)
+
+event_dementia <- run_event_analysis(
+  "Early dementia (MoCA < 21)",
+  "time_to_dementia", "dementia", dd
+)
+
+event_coco <- run_event_analysis(
+  "CoCo score decline >= 1 SD",
+  "time_to_CoCo_change", "CoCo_change", dd
+)
+
+event_tmta <- run_event_analysis(
+  "TMT-A decline >= 1 SD",
+  "time_to_TMTA_change", "TMTA_change", dd
+)
+
+event_tmtb <- run_event_analysis(
+  "TMT-B decline >= 1 SD",
+  "time_to_TMTB_change", "TMTB_change", dd
+)
+
+event_sf <- run_event_analysis(
+  "Semantic fluency decline >= 1 SD",
+  "time_to_SF_change", "SF_change", dd
+)
+
+event_dsst <- run_event_analysis(
+  "DSST decline >= 1 SD",
+  "time_to_DSST_change", "DSST_change", dd
+)
+
+event_moca <- run_event_analysis(
+  "MoCA decline >= 1 SD",
+  "time_to_MoCA_change", "MoCA_change", dd
+)
+```
+
+# Sensitivity analysis: long-term and short-term groups
+
+## Long-term group (FUP3)
+
+### Longitudinal CoCo and MoCA
+
+```{r fup3-lme, results='asis'}
+cat("\n\n#### CoCo: TMAO quintiles\n\n")
+fup3_coco_q <- fit_cognitive_lme_set("CoCo", "tmao_q", FUP3)
+print_model_set(fup3_coco_q)
+print_model_n_set(fup3_coco_q, FUP3, extra_vars = c("center", "pat.id"))
+
+cat("\n\n#### CoCo: TMAO continuous\n\n")
+fup3_coco_cont <- fit_cognitive_lme_set("CoCo", "tmao_log", FUP3)
+print_model_set(fup3_coco_cont)
+print_model_n_set(fup3_coco_cont, FUP3, extra_vars = c("center", "pat.id"))
+
+cat("\n\n#### MoCA: TMAO quintiles\n\n")
+fup3_moca_q <- fit_cognitive_lme_set("MoCA", "tmao_q", FUP3)
+print_model_set(fup3_moca_q)
+print_model_n_set(fup3_moca_q, FUP3, extra_vars = c("center", "pat.id"))
+
+cat("\n\n#### MoCA: TMAO continuous\n\n")
+fup3_moca_cont <- fit_cognitive_lme_set("MoCA", "tmao_log", FUP3)
+print_model_set(fup3_moca_cont)
+print_model_n_set(fup3_moca_cont, FUP3, extra_vars = c("center", "pat.id"))
+```
+
+### Long-term time-to-event analyses
+
+```{r fup3-events, results='asis'}
+fup3_mci <- run_event_analysis(
+  "FUP3: Mild cognitive impairment (MoCA < 26)",
+  "time_to_cog_impairment", "cog_impairment", FUP3
+)
+
+fup3_coco_event <- run_event_analysis(
+  "FUP3: CoCo score decline >= 1 SD",
+  "time_to_CoCo_change", "CoCo_change", FUP3
+)
+```
+
+## Short-term group (WGS)
+
+
+```{r wgs-events, results='asis'}
+wgs_mci <- run_event_analysis(
+  "WGS: Mild cognitive impairment (MoCA < 26)",
+  "time_to_cog_impairment", "cog_impairment", WGS
+)
+```
+
+# Stroke subgroup analyses
+
+The supplied stroke-subgroup scripts omit previous stroke/TIA from Model 3 onward because stroke phenotype defines the subgroup. The random structure for the subgroup longitudinal MoCA models remains a random intercept within centre/patient, matching the supplied subgroup file.
+
+```{r stroke-model-specification}
+cog_stroke_covariates <- list(
+  "Model 1" = c(
+    "age.bl", "pat.sex", "highest.education.level.groups",
+    "gesundheitszustand", "gds.total"
+  ),
+  "Model 2" = c(
+    "age.bl", "pat.sex", "highest.education.level.groups",
+    "gesundheitszustand", "gds.total",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption"
+  ),
+  "Model 3" = c(
+    "age.bl", "pat.sex", "highest.education.level.groups",
+    "gesundheitszustand", "gds.total",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease"
+  ),
+  "Model 4a" = c(
+    "age.bl", "pat.sex", "highest.education.level.groups",
+    "gesundheitszustand", "gds.total",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease", "creatinine.gfr"
+  ),
+  "Model 4b" = c(
+    "age.bl", "pat.sex", "highest.education.level.groups",
+    "gesundheitszustand", "gds.total",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease", "prev.diabetes"
+  ),
+  "Model 5" = c(
+    "age.bl", "pat.sex", "highest.education.level.groups",
+    "gesundheitszustand", "gds.total",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease", "prev.diabetes", "creatinine.gfr"
+  )
+)
+
+ddns <- dd %>% filter(type_of_lesion == "No Stroke")
+ddos <- dd %>% filter(type_of_lesion == "Overt Stroke")
+ddss <- dd %>% filter(type_of_lesion == "Silent Stroke")
+```
+
+## Longitudinal MoCA according to stroke subtype
+
+```{r stroke-moca, results='asis'}
+for (subgroup_name in c("No Stroke", "Overt Stroke", "Silent Stroke")) {
+  subgroup_data <- switch(
+    subgroup_name,
+    "No Stroke" = ddns,
+    "Overt Stroke" = ddos,
+    "Silent Stroke" = ddss
+  )
+
+  cat("\n\n### ", subgroup_name, "\n\n", sep = "")
+
+  cat("\n\n#### TMAO quintiles\n\n")
+  q_models <- fit_cognitive_lme_set(
+    "MoCA", "tmao_q", subgroup_data,
+    random = ~ 1 | center/pat.id,
+    covariates = cog_stroke_covariates
+  )
+  print_model_set(q_models)
+  print_model_n_set(q_models, subgroup_data, extra_vars = c("center", "pat.id"))
+
+  cat("\n\n#### TMAO continuous\n\n")
+  c_models <- fit_cognitive_lme_set(
+    "MoCA", "tmao_log", subgroup_data,
+    random = ~ 1 | center/pat.id,
+    covariates = cog_stroke_covariates
+  )
+  print_model_set(c_models)
+  print_model_n_set(c_models, subgroup_data, extra_vars = c("center", "pat.id"))
+}
+```
+
+## Mild cognitive impairment according to stroke subtype
+
+```{r stroke-mci, results='asis'}
+for (subgroup_name in c("No Stroke", "Overt Stroke", "Silent Stroke")) {
+  subgroup_data <- switch(
+    subgroup_name,
+    "No Stroke" = ddns,
+    "Overt Stroke" = ddos,
+    "Silent Stroke" = ddss
+  )
+
+  cat("\n\n### ", subgroup_name, "\n\n", sep = "")
+
+  q_models <- fit_cox_set(
+    "time_to_cog_impairment", "cog_impairment", "tmao_q",
+    subgroup_data, covariates = cog_stroke_covariates
+  )
+  cat("\n\n#### TMAO quintiles\n\n")
+  print_cox_set(q_models)
+  print_cox_n_set(q_models, subgroup_data)
+
+  c_models <- fit_cox_set(
+    "time_to_cog_impairment", "cog_impairment", "tmao_log",
+    subgroup_data, covariates = cog_stroke_covariates
+  )
+  cat("\n\n#### TMAO continuous\n\n")
+  print_cox_set(c_models)
+  print_cox_n_set(c_models, subgroup_data)
+}
+```
+
+## MoCA decline >= 1 SD according to stroke subtype
+
+The supplied stroke-subgroup file contains this analysis for **No Stroke** and **Overt Stroke**
+
+```{r stroke-moca-decline, results='asis'}
+for (subgroup_name in c("No Stroke", "Overt Stroke")) {
+  subgroup_data <- switch(
+    subgroup_name,
+    "No Stroke" = ddns,
+    "Overt Stroke" = ddos
+  )
+
+  cat("\n\n### ", subgroup_name, "\n\n", sep = "")
+
+  q_models <- fit_cox_set(
+    "time_to_MoCA_change", "MoCA_change", "tmao_q",
+    subgroup_data, covariates = cog_stroke_covariates
+  )
+  cat("\n\n#### TMAO quintiles\n\n")
+  print_cox_set(q_models)
+  print_cox_n_set(q_models, subgroup_data)
+
+  c_models <- fit_cox_set(
+    "time_to_MoCA_change", "MoCA_change", "tmao_log",
+    subgroup_data, covariates = cog_stroke_covariates
+  )
+  cat("\n\n#### TMAO continuous\n\n")
+  print_cox_set(c_models)
+  print_cox_n_set(c_models, subgroup_data)
+}
+```

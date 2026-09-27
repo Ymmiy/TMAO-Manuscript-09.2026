@@ -1,0 +1,397 @@
+---
+title: "TMAO and hippocampal volume"
+author: "P. Lee"
+date: "September 2026 revision"
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 4
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, error = FALSE, message = FALSE, warning = FALSE, cache = FALSE)
+
+library(dplyr)
+library(readr)
+library(nlme)
+library(knitr)
+library(ggplot2)
+library(ggfortify)
+
+options(scipen = 999)
+
+# Fixed-effect table for nlme::lme models.
+print_lme_fixed <- function(model, digits = 3) {
+  tt <- as.data.frame(summary(model)$tTable)
+  tt$Parameter <- rownames(tt)
+  rownames(tt) <- NULL
+
+  crit <- qt(0.975, df = tt$DF)
+  tt$CI_low <- tt$Value - crit * tt$Std.Error
+  tt$CI_high <- tt$Value + crit * tt$Std.Error
+
+  p_fmt <- ifelse(
+    is.na(tt$`p-value`),
+    NA_character_,
+    ifelse(
+      tt$`p-value` < 0.001,
+      "<0.001",
+      formatC(tt$`p-value`, format = "f", digits = digits)
+    )
+  )
+
+  out <- data.frame(
+    Parameter = tt$Parameter,
+    Estimate = round(tt$Value, digits),
+    SE = round(tt$Std.Error, digits),
+    `95% CI` = sprintf(
+      paste0("%.", digits, "f to %.", digits, "f"),
+      tt$CI_low, tt$CI_high
+    ),
+    DF = tt$DF,
+    `t value` = round(tt$`t-value`, digits),
+    `p value` = p_fmt,
+    check.names = FALSE
+  )
+
+  print(knitr::kable(out, align = c("l", "r", "r", "c", "r", "r", "r")))
+}
+
+model_n_by_quintile <- function(model, data, id = "pat.id", quintile = "tmao_q",
+                                extra_vars = character()) {
+  vars <- unique(c(all.vars(formula(model)), id, quintile, extra_vars))
+  vars <- vars[vars %in% names(data)]
+
+  used <- data %>%
+    filter(if_all(all_of(vars), ~ !is.na(.x)))
+
+  used %>%
+    group_by(.data[[quintile]]) %>%
+    summarise(
+      N = n_distinct(.data[[id]]),
+      .groups = "drop"
+    )
+}
+
+print_model_set <- function(models) {
+  for (nm in names(models)) {
+    cat("\n\n#### ", nm, "\n\n", sep = "")
+    print_lme_fixed(models[[nm]])
+  }
+}
+
+print_model_n_set <- function(models, data, extra_vars = character()) {
+  out <- bind_rows(lapply(names(models), function(nm) {
+    model_n_by_quintile(
+      models[[nm]],
+      data = data,
+      extra_vars = extra_vars
+    ) %>%
+      mutate(Model = nm, .before = 1)
+  }))
+
+  print(knitr::kable(
+    out,
+    col.names = c("Model", "TMAO quintile", "N")
+  ))
+}
+
+```
+
+# Data preparation
+
+```{r data-preparation, results='asis'}
+
+baseline_raw <- read_csv("Baseline.csv", show_col_types = FALSE)
+
+baseline_tmao <- baseline_raw %>%
+  transmute(
+    pat.id = as.character(pat.id),
+    tmao_q = as.factor(tmao_q)
+  ) %>%
+  distinct()
+
+if (anyDuplicated(baseline_tmao$pat.id)) {
+  stop("Baseline.csv contains more than one TMAO-quintile value for at least one pat.id.")
+}
+
+attach_baseline_tmao_q <- function(data, baseline_lookup = baseline_tmao) {
+  data %>%
+    mutate(pat.id = as.character(pat.id)) %>%
+    select(-any_of("tmao_q")) %>%
+    left_join(baseline_lookup, by = "pat.id")
+}
+
+check_tmao_q_fixed <- function(data, dataset_name = deparse(substitute(data))) {
+  changing <- data %>%
+    filter(!is.na(tmao_q)) %>%
+    group_by(pat.id) %>%
+    summarise(n_tmao_q = n_distinct(tmao_q), .groups = "drop") %>%
+    filter(n_tmao_q > 1)
+
+  if (nrow(changing) > 0) {
+    stop(dataset_name, ": tmao_q is not fixed within participant.")
+  }
+  invisible(TRUE)
+}
+
+# Baseline quintile counts used in the manuscript cohort.
+baseline_tmao %>%
+  count(tmao_q, name = "N") %>%
+  knitr::kable()
+
+
+dd <- baseline_raw %>%
+  mutate(
+    pat.id = as.character(pat.id),
+    tmao_q = as.factor(tmao_q),
+    tmao_log = log1p(tmao),
+    type_of_lesion = as.factor(type_of_lesion)
+  )
+
+# Follow-up/sensitivity datasets inherit the TMAO quintile from Baseline.csv.
+fup3 <- read_csv("FUP3.long.csv", show_col_types = FALSE) %>%
+  attach_baseline_tmao_q() %>%
+  mutate(tmao_log = log1p(tmao))
+
+wgs <- read_csv("WGS.long.csv", show_col_types = FALSE) %>%
+  attach_baseline_tmao_q() %>%
+  mutate(tmao_log = log1p(tmao))
+
+check_tmao_q_fixed(dd, "Baseline.csv")
+check_tmao_q_fixed(fup3, "FUP3.csv")
+check_tmao_q_fixed(wgs, "WGS.csv")
+```
+
+# Model definitions
+
+```{r model-specification}
+hv_covariates <- list(
+  "Model 1" = c(
+    "age.bl", "pat.sex", "sbtiv.vol", "highest.education.level.groups"
+  ),
+  "Model 2" = c(
+    "age.bl", "pat.sex", "sbtiv.vol", "highest.education.level.groups",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption"
+  ),
+  "Model 3" = c(
+    "age.bl", "pat.sex", "sbtiv.vol", "highest.education.level.groups",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease", "prev.stroke.tia"
+  ),
+  "Model 4a" = c(
+    "age.bl", "pat.sex", "sbtiv.vol", "highest.education.level.groups",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease", "prev.stroke.tia", "creatinine.gfr"
+  ),
+  "Model 4b" = c(
+    "age.bl", "pat.sex", "sbtiv.vol", "highest.education.level.groups",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease", "prev.stroke.tia", "prev.diabetes"
+  ),
+  "Model 5" = c(
+    "age.bl", "pat.sex", "sbtiv.vol", "highest.education.level.groups",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease", "prev.stroke.tia",
+    "prev.diabetes", "creatinine.gfr"
+  )
+)
+
+build_cross_sectional_formula <- function(outcome, exposure, covariates) {
+  as.formula(
+    paste(outcome, "~", paste(c(exposure, covariates), collapse = " + "))
+  )
+}
+
+fit_hv_set <- function(outcome, exposure, data,
+                       covariates = hv_covariates) {
+  setNames(lapply(names(covariates), function(nm) {
+    nlme::lme(
+      fixed = build_cross_sectional_formula(
+        outcome, exposure, covariates[[nm]]
+      ),
+      random = ~ 1 | center,
+      data = data,
+      na.action = na.exclude
+    )
+  }), names(covariates))
+}
+```
+
+# Association between TMAO and hippocampal volume
+
+Explanatory variables are baseline TMAO quintiles and continuous log-transformed TMAO. Random intercepts are specified for centre.
+
+## Bilateral hippocampal volume
+
+### TMAO quintiles
+
+```{r hvraw-quintile, results='asis'}
+hvraw_q <- fit_hv_set("HVraw", "tmao_q", dd)
+print_model_set(hvraw_q)
+cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(hvraw_q, dd, extra_vars = "center")
+```
+
+### TMAO continuous
+
+```{r hvraw-continuous, results='asis'}
+hvraw_cont <- fit_hv_set("HVraw", "tmao_log", dd)
+print_model_set(hvraw_cont)
+cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(hvraw_cont, dd, extra_vars = "center")
+```
+
+### One diagnostic plot for bilateral hippocampal volume
+
+```{r hvraw-autoplot, fig.width=10, fig.height=8}
+hv_diag_lm <- lm(
+  formula = build_cross_sectional_formula(
+    "HVraw", "tmao_q", hv_covariates[["Model 5"]]
+  ),
+  data = dd,
+  na.action = na.exclude
+)
+
+ggfortify::autoplot(hv_diag_lm, which = c(1, 2, 3, 5), ncol = 2)
+```
+
+## Left hippocampal volume
+
+### TMAO quintiles
+
+```{r lhv-quintile, results='asis'}
+lhv_q <- fit_hv_set("LHV", "tmao_q", dd)
+print_model_set(lhv_q)
+cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(lhv_q, dd, extra_vars = "center")
+```
+
+### TMAO continuous
+
+```{r lhv-continuous, results='asis'}
+lhv_cont <- fit_hv_set("LHV", "tmao_log", dd)
+print_model_set(lhv_cont)
+cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(lhv_cont, dd, extra_vars = "center")
+```
+
+## Right hippocampal volume
+
+### TMAO quintiles
+
+```{r rhv-quintile, results='asis'}
+rhv_q <- fit_hv_set("RHV", "tmao_q", dd)
+print_model_set(rhv_q)
+cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(rhv_q, dd, extra_vars = "center")
+```
+
+### TMAO continuous
+
+```{r rhv-continuous, results='asis'}
+rhv_cont <- fit_hv_set("RHV", "tmao_log", dd)
+print_model_set(rhv_cont)
+cat("\n\n#### Analysis N by baseline TMAO quintile\n\n")
+print_model_n_set(rhv_cont, dd, extra_vars = "center")
+```
+
+# Stroke subgroup analyses
+
+As in the supplied hippocampal-volume subgroup code, previous stroke/TIA is not included as an adjustment variable within stroke-defined subgroups.
+
+```{r stroke-model-specification}
+hv_stroke_covariates <- list(
+  "Model 1" = c(
+    "age.bl", "pat.sex", "sbtiv.vol", "highest.education.level.groups"
+  ),
+  "Model 2" = c(
+    "age.bl", "pat.sex", "sbtiv.vol", "highest.education.level.groups",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption"
+  ),
+  "Model 3" = c(
+    "age.bl", "pat.sex", "sbtiv.vol", "highest.education.level.groups",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease"
+  ),
+  "Model 4a" = c(
+    "age.bl", "pat.sex", "sbtiv.vol", "highest.education.level.groups",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease", "creatinine.gfr"
+  ),
+  "Model 4b" = c(
+    "age.bl", "pat.sex", "sbtiv.vol", "highest.education.level.groups",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease", "prev.diabetes"
+  ),
+  "Model 5" = c(
+    "age.bl", "pat.sex", "sbtiv.vol", "highest.education.level.groups",
+    "rauchen", "bmi", "prev.hypertonie", "sport", "total.alcohol.consumption",
+    "prev.coronary.heart.disease", "prev.diabetes", "creatinine.gfr"
+  )
+)
+
+dos <- dd %>% filter(type_of_lesion == "Overt Stroke")
+dss <- dd %>% filter(type_of_lesion == "Silent Stroke")
+dns <- dd %>% filter(type_of_lesion == "No Stroke")
+```
+
+```{r hv-stroke-subgroups, results='asis'}
+for (subgroup_name in c("Overt Stroke", "Silent Stroke", "No Stroke")) {
+  subgroup_data <- switch(
+    subgroup_name,
+    "Overt Stroke" = dos,
+    "Silent Stroke" = dss,
+    "No Stroke" = dns
+  )
+
+  cat("\n\n## ", subgroup_name, "\n\n", sep = "")
+
+  cat("\n\n### TMAO quintiles\n\n")
+  q_models <- fit_hv_set(
+    "HVraw", "tmao_q", subgroup_data,
+    covariates = hv_stroke_covariates
+  )
+  print_model_set(q_models)
+  print_model_n_set(q_models, subgroup_data, extra_vars = "center")
+
+  cat("\n\n### TMAO continuous\n\n")
+  c_models <- fit_hv_set(
+    "HVraw", "tmao_log", subgroup_data,
+    covariates = hv_stroke_covariates
+  )
+  print_model_set(c_models)
+  print_model_n_set(c_models, subgroup_data, extra_vars = "center")
+}
+```
+
+# Sensitivity analyses: long-term and short-term groups
+
+The same six-model sequence is applied to the long-term (`FUP3.csv`) and short-term (`WGS.csv`) hippocampal-volume sensitivity datasets. These datasets now inherit their quintile from `Baseline.csv` rather than recalculating quintiles within the smaller follow-up samples.
+
+```{r hv-sensitivity, results='asis'}
+for (analysis_name in c("Long-term group", "Short-term group")) {
+  analysis_data <- switch(
+    analysis_name,
+    "Long-term group" = fup3,
+    "Short-term group" = wgs
+  )
+
+  cat("\n\n## ", analysis_name, "\n\n", sep = "")
+
+  cat("\n\n### TMAO quintiles\n\n")
+  q_models <- fit_hv_set("HVraw", "tmao_q", analysis_data)
+  print_model_set(q_models)
+  print_model_n_set(q_models, analysis_data, extra_vars = "center")
+
+  cat("\n\n### TMAO continuous\n\n")
+  c_models <- fit_hv_set("HVraw", "tmao_log", analysis_data)
+  print_model_set(c_models)
+  print_model_n_set(c_models, analysis_data, extra_vars = "center")
+}
+```
