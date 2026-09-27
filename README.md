@@ -133,16 +133,7 @@ Analyses were conducted in R.
 
 The code primarily uses packages including:
 
-```r
-tidyverse
-nlme
-survival
-survminer
-arsenal
-ggplot2
-ggpubr
-knitr
-```
+nlme (3.1-167), forestplot (3.1.6), ggfortify (0.4.17), lme4 (1.1-36), ggpubr (0.6.1), ggcorrplot (0.1.4.1), PerformanceAnalytics (2.0.8), tidyverse (2.0.0), survival (3.8-3), survminer (0.5.0), parameters (0.24.2), sjtable2df (0.0.4), finalfit (1.0.8), broom (1.0.8), forcats (1.0.0), gridExtra (2.3), arsenal (3.7.1), knitr (1.52)
 
 Additional packages are used for specific analyses and figures.
 
